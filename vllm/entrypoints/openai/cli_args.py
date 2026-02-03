@@ -73,6 +73,10 @@ class LoRAParserAction(argparse.Action):
 class FrontendArgs:
     """Arguments for the OpenAI-compatible frontend server."""
 
+    backend: Literal["vllm", "turbomind"] = "vllm"
+    """Engine backend to use for serving. "turbomind" uses TurboMind with a
+    vLLM-compatible adapter."""
+
     host: str | None = None
     """Host name."""
     port: int = 8000

@@ -41,6 +41,7 @@ Slack="https://slack.vllm.ai/"
 
 [project.scripts]
 vllm = "vllm.entrypoints.cli.main:main"
+lmdeploy = "lmdeploy.cli:run"
 
 [project.entry-points."vllm.general_plugins"]
 lora_filesystem_resolver = "vllm.plugins.lora_resolvers.filesystem_resolver:register_filesystem_resolver"
@@ -51,10 +52,11 @@ lora_hf_hub_resolver = "vllm.plugins.lora_resolvers.hf_hub_resolver:register_hf_
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["vllm*"]
+include = ["vllm*", "lmdeploy*"]
 
 [tool.ruff.lint.per-file-ignores]
 "vllm/third_party/**" = ["ALL"]
+"lmdeploy/**" = ["ALL"]
 "vllm/version.py" = ["F401"]
 "vllm/_version.py" = ["ALL"]
 # Exclude generated protobuf files

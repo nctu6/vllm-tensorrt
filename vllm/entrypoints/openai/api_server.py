@@ -89,11 +89,13 @@ async def build_async_engine_client(
     if disable_frontend_multiprocessing is None:
         disable_frontend_multiprocessing = bool(args.disable_frontend_multiprocessing)
 
+    engine_backend = getattr(args, "backend", "vllm")
     async with build_async_engine_client_from_engine_args(
         engine_args,
         usage_context=usage_context,
         disable_frontend_multiprocessing=disable_frontend_multiprocessing,
         client_config=client_config,
+        engine_backend=engine_backend,
     ) as engine:
         yield engine
 
@@ -105,6 +107,7 @@ async def build_async_engine_client_from_engine_args(
     usage_context: UsageContext = UsageContext.OPENAI_API_SERVER,
     disable_frontend_multiprocessing: bool = False,
     client_config: dict[str, Any] | None = None,
+    engine_backend: str = "vllm",
 ) -> AsyncIterator[EngineClient]:
     """
     Create EngineClient, either:
@@ -117,8 +120,23 @@ async def build_async_engine_client_from_engine_args(
     # Create the EngineConfig (determines if we can use V1).
     vllm_config = engine_args.create_engine_config(usage_context=usage_context)
 
+    if engine_backend not in ("vllm", "turbomind"):
+        raise ValueError(f"Unknown engine backend: {engine_backend}")
+
     if disable_frontend_multiprocessing:
         logger.warning("V1 is enabled, but got --disable-frontend-multiprocessing.")
+
+    if engine_backend == "turbomind":
+        if disable_frontend_multiprocessing:
+            logger.debug("Frontend multiprocessing disabled (ignored for turbomind).")
+        from vllm.v1.engine.turbomind_engine import TurbomindEngineClient
+
+        tm_client = TurbomindEngineClient.from_vllm_config(vllm_config)
+        try:
+            yield tm_client
+        finally:
+            tm_client.shutdown()
+        return
 
     from vllm.v1.engine.async_llm import AsyncLLM
 

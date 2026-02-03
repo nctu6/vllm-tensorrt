@@ -157,8 +157,19 @@ class DevelopAndGenerateGrpc(develop):
 
 
 class CMakeExtension(Extension):
-    def __init__(self, name: str, cmake_lists_dir: str = ".", **kwa) -> None:
-        super().__init__(name, sources=[], py_limited_api=not is_freethreaded(), **kwa)
+    def __init__(
+        self,
+        name: str,
+        cmake_lists_dir: str = ".",
+        py_limited_api_override: bool | None = None,
+        **kwa,
+    ) -> None:
+        py_limited_api = (
+            not is_freethreaded()
+            if py_limited_api_override is None
+            else py_limited_api_override
+        )
+        super().__init__(name, sources=[], py_limited_api=py_limited_api, **kwa)
         self.cmake_lists_dir = os.path.abspath(cmake_lists_dir)
 
 
@@ -297,6 +308,11 @@ class cmake_build_ext(build_ext):
         )
 
     def build_extensions(self) -> None:
+        # Keep build artifacts under the repo to avoid rebuilding from /tmp.
+        build_base = os.environ.get("VLLM_BUILD_BASE", str(ROOT_DIR / "build"))
+        self.build_temp = os.path.join(build_base, "temp")
+        self.build_lib = os.path.join(build_base, "lib")
+
         # Ensure that CMake is present and working
         try:
             subprocess.check_output(["cmake", "--version"])
@@ -354,6 +370,18 @@ class cmake_build_ext(build_ext):
                 target_name(ext.name),
             ]
             subprocess.check_call(install_args, cwd=self.build_temp)
+
+        # Ensure top-level TurboMind modules land where setuptools expects.
+        for ext in self.extensions:
+            if ext.name not in {"_turbomind", "_xgrammar"}:
+                continue
+            expected = Path(self.get_ext_fullpath(ext.name))
+            if expected.exists():
+                continue
+            candidate = Path(self.build_temp) / "lib" / expected.name
+            if candidate.exists():
+                expected.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(candidate, expected)
 
     def run(self):
         # First, run the standard build_ext command to compile the extensions
@@ -970,6 +998,12 @@ if _is_hip():
     ext_modules.append(CMakeExtension(name="vllm._rocm_C"))
 
 if _is_cuda():
+    ext_modules.append(
+        CMakeExtension(name="_turbomind", py_limited_api_override=False)
+    )
+    ext_modules.append(
+        CMakeExtension(name="_xgrammar", py_limited_api_override=False)
+    )
     ext_modules.append(CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa2_C"))
     if envs.VLLM_USE_PRECOMPILED or (
         CUDA_HOME and get_nvcc_cuda_version() >= Version("12.3")
