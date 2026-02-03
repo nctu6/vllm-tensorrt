@@ -72,6 +72,9 @@ class StreamingSemaphore:
             if self.fut and not self.fut.done():
                 self.fut.set_result(None)
 
+    def release_threadsafe(self) -> None:
+        self.loop.call_soon_threadsafe(self.release)
+
 
 @dataclass
 class TMOutput:
@@ -454,7 +457,7 @@ class TurboMindRequestHandle:
             gen_cfg,
             stream_output,
             False,
-            lambda: sem.release(),
+            sem.release_threadsafe,
         )
 
         outputs = _tm_dict_to_torch_dict(outputs)
@@ -595,7 +598,7 @@ class TurbomindEngineClient(EngineClient):
         if lora_request is not None:
             raise ValueError("LoRA is not supported by turbomind backend.")
         if tokenization_kwargs:
-            raise ValueError("tokenization_kwargs are not supported by turbomind backend.")
+            logger.debug("tokenization_kwargs ignored by turbomind backend.")
         if trace_headers:
             logger.debug("trace_headers ignored by turbomind backend.")
         if priority or data_parallel_rank:
@@ -733,10 +736,11 @@ class TurbomindEngineClient(EngineClient):
             self._errored = True
             self._dead_error = exc
             logger.exception("TurboMind generation failed for request %s", request_id)
+            await handle.async_cancel()
             raise
         finally:
             self._req_id_to_session.pop(request_id, None)
-            await handle.async_end(session_id)
+            # TurboMind ends sessions internally when sequence_end is True.
 
     async def encode(
         self,
