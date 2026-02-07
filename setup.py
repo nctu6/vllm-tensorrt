@@ -275,6 +275,36 @@ class cmake_build_ext(build_ext):
         fc_base_dir = os.environ.get("FETCHCONTENT_BASE_DIR", fc_base_dir)
         cmake_args += ["-DFETCHCONTENT_BASE_DIR={}".format(fc_base_dir)]
 
+        # Wire TensorRT from a local clone if provided or present in-repo.
+        tensorrt_root = os.environ.get("VLLM_TENSORRT_ROOT") or os.environ.get(
+            "TENSORRT_ROOT"
+        )
+        if not tensorrt_root:
+            candidate = os.path.join(ROOT_DIR, "third_party", "tensorrt", "install")
+            if os.path.isdir(os.path.join(candidate, "include")):
+                tensorrt_root = candidate
+        if not tensorrt_root:
+            candidate = os.path.join(ROOT_DIR, "third_party", "tensorrt")
+            if os.path.isdir(os.path.join(candidate, "include")):
+                tensorrt_root = candidate
+        if not tensorrt_root:
+            candidate = os.path.join(ROOT_DIR, "TensorRT")
+            if os.path.isdir(os.path.join(candidate, "include")):
+                tensorrt_root = candidate
+        if tensorrt_root:
+            cmake_args += [
+                f"-DTENSORRT_ROOT={tensorrt_root}",
+                f"-DTensorRT_ROOT={tensorrt_root}",
+            ]
+            cmake_prefix = os.environ.get("CMAKE_PREFIX_PATH", "")
+            if tensorrt_root not in cmake_prefix.split(os.pathsep):
+                cmake_prefix = (
+                    tensorrt_root
+                    if not cmake_prefix
+                    else tensorrt_root + os.pathsep + cmake_prefix
+                )
+            cmake_args += [f"-DCMAKE_PREFIX_PATH={cmake_prefix}"]
+
         #
         # Setup parallelism and build tool
         #
@@ -308,6 +338,7 @@ class cmake_build_ext(build_ext):
         )
 
     def build_extensions(self) -> None:
+        _tensorrt_preflight()
         # Keep build artifacts under the repo to avoid rebuilding from /tmp.
         build_base = os.environ.get("VLLM_BUILD_BASE", str(ROOT_DIR / "build"))
         self.build_temp = os.path.join(build_base, "temp")
@@ -416,6 +447,11 @@ class cmake_build_ext(build_ext):
                 "vllm/third_party/triton_kernels",
                 dirs_exist_ok=True,
             )
+            # copy TensorRT-LLM artifacts into the source tree for editable builds
+            trtllm_src = os.path.join(self.build_lib, "tensorrt_llm")
+            if os.path.isdir(trtllm_src):
+                print(f"Copying {trtllm_src} to tensorrt_llm")
+                shutil.copytree(trtllm_src, "tensorrt_llm", dirs_exist_ok=True)
 
 
 class precompiled_build_ext(build_ext):
@@ -985,6 +1021,40 @@ def get_requirements() -> list[str]:
     return requirements
 
 
+def _tensorrt_preflight() -> None:
+    if not _is_cuda():
+        return
+    candidates = []
+    if os.environ.get("TENSORRT_ROOT"):
+        candidates.append(os.environ["TENSORRT_ROOT"])
+    if os.environ.get("VLLM_TENSORRT_ROOT"):
+        candidates.append(os.environ["VLLM_TENSORRT_ROOT"])
+    candidates.append(str(ROOT_DIR / "third_party" / "tensorrt" / "install"))
+    candidates.append(str(ROOT_DIR / "third_party" / "tensorrt"))
+    candidates.extend(
+        [
+            "/usr/lib/x86_64-linux-gnu",
+            "/usr/lib",
+            "/usr/local/lib",
+            "/usr/local/lib64",
+        ]
+    )
+    lib_names = ("libnvinfer.so", "libnvinfer.so.10", "libnvonnxparser.so")
+    for root in candidates:
+        for libdir in ("", "lib", "lib64", "targets/x86_64-linux-gnu/lib"):
+            path = os.path.join(root, libdir) if libdir else root
+            if any(os.path.exists(os.path.join(path, n)) for n in lib_names):
+                return
+    raise RuntimeError(
+        "TensorRT libraries not found. Install system packages or provide a "
+        "TensorRT binary distribution. For Ubuntu:\n"
+        "  sudo apt-get install -y libnvinfer10 libnvinfer-dev "
+        "libnvonnxparsers10\n"
+        "Alternatively, unpack the TensorRT tarball under "
+        f"{ROOT_DIR / 'third_party' / 'tensorrt'}."
+    )
+
+
 ext_modules = []
 
 if _is_cuda() or _is_hip():
@@ -998,6 +1068,9 @@ if _is_hip():
     ext_modules.append(CMakeExtension(name="vllm._rocm_C"))
 
 if _is_cuda():
+    # Optional since this does not produce a Python extension; it stages
+    # TensorRT-LLM artifacts into the package.
+    ext_modules.append(CMakeExtension(name="tensorrt_llm", optional=True))
     ext_modules.append(
         CMakeExtension(name="_turbomind", py_limited_api_override=False)
     )

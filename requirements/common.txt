@@ -4,6 +4,7 @@ psutil
 sentencepiece  # Required for LLaMA tokenizer.
 numpy
 mmengine
+nvtx
 requests >= 2.26.0
 tqdm
 blake3

@@ -73,9 +73,9 @@ class LoRAParserAction(argparse.Action):
 class FrontendArgs:
     """Arguments for the OpenAI-compatible frontend server."""
 
-    backend: Literal["vllm", "turbomind"] = "vllm"
+    backend: Literal["vllm", "turbomind", "tensorrt"] = "vllm"
     """Engine backend to use for serving. "turbomind" uses TurboMind with a
-    vLLM-compatible adapter."""
+    vLLM-compatible adapter. "tensorrt" uses TensorRT-LLM with an engine dir."""
 
     host: str | None = None
     """Host name."""

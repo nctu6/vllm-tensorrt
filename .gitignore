@@ -10,6 +10,10 @@ vllm/third_party/triton_kernels/*
 # FlashMLA interface copied from source
 vllm/third_party/flashmla/flash_mla_interface.py
 
+# Vendored TensorRT build artifacts
+vllm/third_party/tensorrt/build*/
+vllm/third_party/tensorrt/install/
+
 # triton jit
 .triton
 

@@ -120,7 +120,7 @@ async def build_async_engine_client_from_engine_args(
     # Create the EngineConfig (determines if we can use V1).
     vllm_config = engine_args.create_engine_config(usage_context=usage_context)
 
-    if engine_backend not in ("vllm", "turbomind"):
+    if engine_backend not in ("vllm", "turbomind", "tensorrt"):
         raise ValueError(f"Unknown engine backend: {engine_backend}")
 
     if disable_frontend_multiprocessing:
@@ -136,6 +136,18 @@ async def build_async_engine_client_from_engine_args(
             yield tm_client
         finally:
             tm_client.shutdown()
+        return
+
+    if engine_backend == "tensorrt":
+        if disable_frontend_multiprocessing:
+            logger.debug("Frontend multiprocessing disabled (ignored for tensorrt).")
+        from vllm.v1.engine.tensorrt_engine import TensorRTLLMEngineClient
+
+        trt_client = TensorRTLLMEngineClient.from_vllm_config(vllm_config)
+        try:
+            yield trt_client
+        finally:
+            trt_client.shutdown()
         return
 
     from vllm.v1.engine.async_llm import AsyncLLM
