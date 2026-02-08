@@ -550,7 +550,7 @@ def main(*,
         # (Easier than MSBuild to make compatible with our Docker image)
 
     if generator:
-        cmake_generator = "-G" + generator
+        cmake_generator = f'-G "{generator}"'
 
     if job_count is None:
         job_count = cpu_count()

@@ -313,15 +313,20 @@ class cmake_build_ext(build_ext):
         if nvcc_threads:
             cmake_args += ["-DNVCC_THREADS={}".format(nvcc_threads)]
 
-        if is_ninja_available():
+        cmake_generator = os.environ.get("CMAKE_GENERATOR", "").strip()
+        if not cmake_generator:
+            cmake_generator = os.environ.get("VLLM_CMAKE_GENERATOR", "").strip()
+        if not cmake_generator:
+            cmake_generator = "Unix Makefiles"
+
+        if cmake_generator.lower() == "ninja":
             build_tool = ["-G", "Ninja"]
             cmake_args += [
                 "-DCMAKE_JOB_POOL_COMPILE:STRING=compile",
                 "-DCMAKE_JOB_POOLS:STRING=compile={}".format(num_jobs),
             ]
         else:
-            # Default build tool to whatever cmake picks.
-            build_tool = []
+            build_tool = ["-G", cmake_generator]
         # Make sure we use the nvcc from CUDA_HOME
         if _is_cuda() and CUDA_HOME is not None:
             cmake_args += [f"-DCMAKE_CUDA_COMPILER={CUDA_HOME}/bin/nvcc"]
