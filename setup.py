@@ -419,6 +419,40 @@ class cmake_build_ext(build_ext):
                 expected.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(candidate, expected)
 
+        # Ensure expected extension filenames exist (e.g. .abi3.so vs .so).
+        for ext in self.extensions:
+            self._ensure_expected_extension_path(ext)
+
+    def _ensure_expected_extension_path(self, ext: CMakeExtension) -> None:
+        expected = Path(self.get_ext_fullpath(ext.name))
+        if expected.exists():
+            return
+
+        module_basename = ext.name.split(".")[-1]
+        search_dirs = [
+            expected.parent,
+            Path(self.build_temp) / "lib",
+            Path(self.build_temp),
+        ]
+        candidates = []
+        for search_dir in search_dirs:
+            if not search_dir.is_dir():
+                continue
+            candidates.extend(sorted(search_dir.glob(f"{module_basename}*.so")))
+            candidates.extend(sorted(search_dir.glob(f"{module_basename}*.pyd")))
+
+        for candidate in candidates:
+            if not candidate.is_file():
+                continue
+            expected.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(candidate, expected)
+            logger.warning(
+                "Expected extension %s missing; copied from %s.",
+                expected,
+                candidate,
+            )
+            return
+
     def run(self):
         # First, run the standard build_ext command to compile the extensions
         super().run()
