@@ -346,6 +346,63 @@ else
   exit 1
 fi
 
+# Ensure kv_cache_manager_v2 rawref extension exists in the vendored package.
+RAWREF_DIR="${TLLM_BINDINGS_DST}/runtime/kv_cache_manager_v2/rawref"
+if [[ -d "${RAWREF_DIR}" ]]; then
+  if ! compgen -G "${RAWREF_DIR}/_rawref*.so" > /dev/null; then
+    echo "[build.sh] Building TensorRT-LLM rawref extension..."
+    if [[ -x "${VLLM_ROOT}/.venv/bin/python" ]]; then
+      PYTHON_BIN="${VLLM_ROOT}/.venv/bin/python"
+    else
+      PYTHON_BIN="$(command -v python || command -v python3)"
+    fi
+    if [[ -z "${PYTHON_BIN}" ]]; then
+      echo "[build.sh] Error: python not found for rawref build."
+      exit 1
+    fi
+    pushd "${RAWREF_DIR}" >/dev/null
+    "${PYTHON_BIN}" setup.py build_ext --inplace
+    popd >/dev/null
+  fi
+fi
+
+# Ensure TensorRT-LLM deep_gemm module is available.
+DEEP_GEMM_DIR="${TLLM_BINDINGS_DST}/deep_gemm"
+DEEP_GEMM_SO="${TLLM_BINDINGS_DST}/deep_gemm_cpp_tllm"
+if ! compgen -G "${DEEP_GEMM_SO}"*.so > /dev/null || [[ ! -d "${DEEP_GEMM_DIR}" ]]; then
+  if [[ -d "${TLLM_BUILD_DIR}" ]]; then
+    echo "[build.sh] Building TensorRT-LLM deep_gemm target..."
+    set +e
+    cmake --build "${TLLM_BUILD_DIR}" --target deep_gemm
+    deep_gemm_status=$?
+    set -e
+    if [[ ${deep_gemm_status} -ne 0 ]]; then
+      echo "[build.sh] Warning: deep_gemm target failed; attempting to use existing artifacts if available."
+    fi
+  fi
+  deep_gemm_so_src=""
+  for cand in "${TLLM_BUILD_DIR}/tensorrt_llm/deep_gemm/"deep_gemm_cpp_tllm*.so; do
+    if [[ -f "${cand}" ]]; then
+      deep_gemm_so_src="${cand}"
+      break
+    fi
+  done
+  deep_gemm_py_src="${TLLM_BUILD_DIR}/tensorrt_llm/deep_gemm/python/deep_gemm"
+  if [[ -n "${deep_gemm_so_src}" ]]; then
+    cp -f "${deep_gemm_so_src}" "${TLLM_BINDINGS_DST}/"
+  fi
+  if [[ -d "${deep_gemm_py_src}" ]]; then
+    rm -rf "${DEEP_GEMM_DIR}"
+    mkdir -p "${DEEP_GEMM_DIR}"
+    cp -a "${deep_gemm_py_src}/." "${DEEP_GEMM_DIR}/"
+  fi
+fi
+if ! compgen -G "${DEEP_GEMM_SO}"*.so > /dev/null || [[ ! -d "${DEEP_GEMM_DIR}" ]]; then
+  echo "[build.sh] Error: TensorRT-LLM deep_gemm artifacts not found after build."
+  echo "[build.sh] Expected ${DEEP_GEMM_SO}*.so and ${DEEP_GEMM_DIR}/"
+  exit 1
+fi
+
 pip install --no-build-isolation -e . 2>&1 | tee pip_install.log
 
 # If TensorRT-LLM bindings were built, copy them into the vendored package.
