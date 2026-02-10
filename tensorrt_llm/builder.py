@@ -388,7 +388,10 @@ class Builder():
                         )
                     continue
                 if not param.set_name(name, network):
-                    raise RuntimeError(f'Failed to set weight: {name}')
+                    logger.warning(
+                        f"Failed to set weight name '{name}'. Skipping refit mark for this weight."
+                    )
+                    continue
                 # This mark_weights_refittable has no side effect when refit_individual is not enabled.
                 network.trt_network.mark_weights_refittable(name)
 

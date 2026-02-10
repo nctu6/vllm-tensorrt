@@ -7,6 +7,10 @@ import threading
 from collections.abc import AsyncGenerator, Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any
+import ctypes
+import os
+import shutil
+import tempfile
 
 import torch
 
@@ -30,9 +34,55 @@ logger = init_logger(__name__)
 _TRTLLM_IMPORT_ERROR: BaseException | None = None
 
 
+def _ensure_real_libcuda_loaded() -> None:
+    if os.name != "posix":
+        return
+    cuda_lib_dirs = []
+    for candidate in (
+        "/usr/local/cuda/targets/x86_64-linux/lib",
+        "/usr/local/cuda/lib64",
+        "/lib/x86_64-linux-gnu",
+        "/usr/lib/x86_64-linux-gnu",
+    ):
+        if os.path.isdir(candidate):
+            cuda_lib_dirs.append(candidate)
+    ld_path = os.environ.get("LD_LIBRARY_PATH", "")
+    if ld_path:
+        parts = [p for p in ld_path.split(":") if p and "stubs" not in p]
+    else:
+        parts = []
+    for libdir in reversed(cuda_lib_dirs):
+        if libdir not in parts:
+            parts.insert(0, libdir)
+    os.environ["LD_LIBRARY_PATH"] = ":".join(parts)
+    for candidate in (
+        "/lib/x86_64-linux-gnu/libcuda.so.1",
+        "/usr/lib/x86_64-linux-gnu/libcuda.so.1",
+    ):
+        if os.path.exists(candidate):
+            try:
+                ctypes.CDLL(candidate, mode=ctypes.RTLD_GLOBAL)
+            except OSError as exc:  # pragma: no cover - best effort
+                logger.warning("Failed to load %s: %s", candidate, exc)
+            break
+    for candidate in (
+        "/usr/local/cuda/targets/x86_64-linux/lib/libcudart.so.12",
+        "/usr/local/cuda/lib64/libcudart.so.12",
+        "/lib/x86_64-linux-gnu/libcudart.so.12",
+        "/usr/lib/x86_64-linux-gnu/libcudart.so.12",
+    ):
+        if os.path.exists(candidate):
+            try:
+                ctypes.CDLL(candidate, mode=ctypes.RTLD_GLOBAL)
+            except OSError as exc:  # pragma: no cover - best effort
+                logger.warning("Failed to load %s: %s", candidate, exc)
+            break
+
+
 def _lazy_import_tensorrt_llm():
     global _TRTLLM_IMPORT_ERROR
     try:
+        _ensure_real_libcuda_loaded()
         from tensorrt_llm.runtime.generation import SamplingConfig  # type: ignore
         from tensorrt_llm.runtime.model_runner_cpp import (  # type: ignore
             ModelRunnerCpp,
@@ -50,6 +100,102 @@ def _require_tensorrt_llm() -> None:
             "TensorRT-LLM backend requires the vendored `tensorrt_llm` package "
             "and its compiled bindings."
         ) from _TRTLLM_IMPORT_ERROR
+
+
+def _dtype_to_trtllm_str(dtype: Any) -> str:
+    if dtype is None:
+        return "auto"
+    if isinstance(dtype, torch.dtype):
+        if dtype is torch.float16:
+            return "float16"
+        if dtype is torch.bfloat16:
+            return "bfloat16"
+        if dtype is torch.float32:
+            return "float32"
+        if dtype is torch.float64:
+            return "float64"
+        return str(dtype)
+    return str(dtype)
+
+
+def _resolve_trtllm_engine_dir(
+    vllm_config: VllmConfig,
+    engine_config: "TRTLLMEngineConfig",
+) -> tuple[str, str | None]:
+    model_dir = vllm_config.model_config.model
+    trust_remote_code = vllm_config.model_config.trust_remote_code
+    workspace = None
+
+    try:
+        from tensorrt_llm.llmapi.llm_args import (  # type: ignore
+            TrtLlmArgs,
+            _ModelFormatKind,
+            get_model_format,
+        )
+        from tensorrt_llm.llmapi.llm_utils import (  # type: ignore
+            CachedModelLoader,
+            LlmBuildStats,
+        )
+    except BaseException as exc:  # pragma: no cover - optional dependency
+        raise ModuleNotFoundError(
+            "TensorRT-LLM backend requires the vendored `tensorrt_llm` package "
+            "and its compiled bindings."
+        ) from exc
+
+    try:
+        model_format = get_model_format(model_dir,
+                                        trust_remote_code=trust_remote_code)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "Failed to infer TensorRT-LLM model format for %s; assuming engine dir. Error: %s",
+            model_dir,
+            exc,
+        )
+        return model_dir, None
+
+    if model_format is _ModelFormatKind.TLLM_ENGINE:
+        return model_dir, None
+
+    tmp_root = "/dev/shm" if os.path.isdir("/dev/shm") else tempfile.gettempdir()
+    workspace = os.path.join(tmp_root, "vllm_trtllm_engine")
+    if os.path.isdir(workspace):
+        shutil.rmtree(workspace)
+    os.makedirs(workspace, exist_ok=True)
+
+    llm_args_kwargs: dict[str, Any] = {
+        "model": model_dir,
+        "tensor_parallel_size": vllm_config.parallel_config.tensor_parallel_size,
+        "dtype": _dtype_to_trtllm_str(vllm_config.model_config.dtype),
+        "trust_remote_code": trust_remote_code,
+        "enable_build_cache": False,
+    }
+
+    if engine_config.max_batch_size is not None:
+        llm_args_kwargs["max_batch_size"] = engine_config.max_batch_size
+    if engine_config.max_input_len is not None:
+        llm_args_kwargs["max_input_len"] = engine_config.max_input_len
+        llm_args_kwargs["max_seq_len"] = engine_config.max_input_len
+    if engine_config.max_beam_width is not None:
+        llm_args_kwargs["max_beam_width"] = engine_config.max_beam_width
+
+    max_num_tokens = getattr(vllm_config.scheduler_config,
+                             "max_num_batched_tokens", None)
+    if max_num_tokens is not None:
+        llm_args_kwargs["max_num_tokens"] = max_num_tokens
+
+    llm_args = TrtLlmArgs(**llm_args_kwargs)
+    stats = LlmBuildStats()
+    loader = CachedModelLoader(llm_args=llm_args,
+                               llm_build_stats=stats,
+                               workspace=workspace)
+    engine_dir, _ = loader()
+
+    if stats.cache_hitted:
+        logger.info("Reusing cached TensorRT-LLM engine at %s", engine_dir)
+    else:
+        logger.info("Built TensorRT-LLM engine at %s", engine_dir)
+
+    return str(engine_dir), workspace
 
 
 @dataclass
@@ -153,8 +299,10 @@ class TensorRTLLMEngineClient(EngineClient):
             self.model_config.io_processor_plugin,
         )
         self._engine_config = engine_config or self._build_engine_config(vllm_config)
+        engine_dir, workspace = _resolve_trtllm_engine_dir(vllm_config, self._engine_config)
+        self._tllm_workspace = workspace
         self._runtime = TensorRTLLMRuntime(
-            engine_dir=self.model_config.model,
+            engine_dir=engine_dir,
             config=self._engine_config,
         )
         self._stopped = False
@@ -455,6 +603,13 @@ class TensorRTLLMEngineClient(EngineClient):
         if self._stopped:
             return
         self._stopped = True
+        if self._tllm_workspace:
+            try:
+                shutil.rmtree(self._tllm_workspace)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to remove TensorRT-LLM workspace %s: %s",
+                               self._tllm_workspace, exc)
+            self._tllm_workspace = None
 
     def _build_engine_config(self, vllm_config: VllmConfig) -> TRTLLMEngineConfig:
         config = TRTLLMEngineConfig()

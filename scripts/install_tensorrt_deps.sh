@@ -9,6 +9,12 @@ Installs TensorRT runtime deps. Optional flags add packages required for
 TensorRT-LLM multi-device (MPI), UCX/NIXL features, Git LFS assets, or
 generate FMHA v2 cubins for SM80 (enabled by default). MPI and UCX are
 installed by default to match TensorRT-LLM defaults.
+
+Environment:
+  TENSORRT_TARBALL_URL     Optional URL to TensorRT tarball (TensorRT-*.tar.gz).
+  TENSORRT_TARBALL_SHA256  Optional SHA256 checksum for the tarball.
+  TENSORRT_INSTALL_DEBS    Install NVIDIA TensorRT debs if libs are missing (default: 1).
+  TENSORRT_DEB_VERSION     TensorRT deb version (default: 10.9.0.34-1+cuda12.8).
 EOF
 }
 
@@ -16,6 +22,11 @@ WITH_MPI=1
 WITH_UCX=1
 WITH_LFS=0
 WITH_FMHA_CUBIN=1
+TENSORRT_PIP_SPEC="${TENSORRT_PIP_SPEC:-10.13.*}"
+USE_LOCAL_TENSORRT="${USE_LOCAL_TENSORRT:-1}"
+ALLOW_PIP_TENSORRT="${ALLOW_PIP_TENSORRT:-0}"
+TENSORRT_INSTALL_DEBS="${TENSORRT_INSTALL_DEBS:-1}"
+TENSORRT_DEB_VERSION="${TENSORRT_DEB_VERSION:-10.9.0.34-1+cuda12.8}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -76,34 +87,45 @@ export VLLM_TLLM_ENABLE_NVSHMEM
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VLLM_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 TRT_VENDOR_ROOT="${VLLM_ROOT}/third_party/tensorrt"
-TRT_ROOT_CANDIDATE=""
-if [[ -d "${TRT_VENDOR_ROOT}/install/include" ]]; then
-  TRT_ROOT_CANDIDATE="${TRT_VENDOR_ROOT}/install"
-elif [[ -d "${TRT_VENDOR_ROOT}/include" ]]; then
-  TRT_ROOT_CANDIDATE="${TRT_VENDOR_ROOT}"
-fi
-if [[ -n "${TRT_ROOT_CANDIDATE}" ]]; then
-  export VLLM_TENSORRT_ROOT="${VLLM_TENSORRT_ROOT:-${TRT_ROOT_CANDIDATE}}"
-  export TENSORRT_ROOT="${TENSORRT_ROOT:-${VLLM_TENSORRT_ROOT}}"
-  export TensorRT_ROOT="${TensorRT_ROOT:-${VLLM_TENSORRT_ROOT}}"
-  export TRT_ROOT="${TRT_ROOT:-${VLLM_TENSORRT_ROOT}}"
-  if [[ -n "${CMAKE_PREFIX_PATH:-}" ]]; then
-    if [[ ":${CMAKE_PREFIX_PATH}:" != *":${VLLM_TENSORRT_ROOT}:"* ]]; then
-      export CMAKE_PREFIX_PATH="${VLLM_TENSORRT_ROOT}:${CMAKE_PREFIX_PATH}"
-    fi
-  else
-    export CMAKE_PREFIX_PATH="${VLLM_TENSORRT_ROOT}"
-  fi
-  for libdir in "${VLLM_TENSORRT_ROOT}/lib" "${VLLM_TENSORRT_ROOT}/lib64" \
-                "${VLLM_TENSORRT_ROOT}/targets/x86_64-linux/lib"; do
-    if [[ -d "${libdir}" ]]; then
-      export LD_LIBRARY_PATH="${libdir}:${LD_LIBRARY_PATH:-}"
-      export LIBRARY_PATH="${libdir}:${LIBRARY_PATH:-}"
-    fi
-  done
-  echo "Using TensorRT root: ${VLLM_TENSORRT_ROOT}"
-fi
 
+ensure_trt_tarball() {
+  local existing=""
+  existing="$(find "${TRT_VENDOR_ROOT}" -maxdepth 2 -type f -name 'TensorRT-*.tar*' -print -quit 2>/dev/null || true)"
+  if [[ -n "${existing}" ]]; then
+    return 0
+  fi
+  if [[ -z "${TENSORRT_TARBALL_URL:-}" ]]; then
+    return 0
+  fi
+  local tarball="${TRT_VENDOR_ROOT}/$(basename "${TENSORRT_TARBALL_URL}")"
+  echo "Downloading TensorRT tarball to ${tarball}..."
+  curl -L --fail --retry 3 --retry-delay 2 -o "${tarball}" "${TENSORRT_TARBALL_URL}"
+  if [[ -n "${TENSORRT_TARBALL_SHA256:-}" ]]; then
+    echo "${TENSORRT_TARBALL_SHA256}  ${tarball}" | sha256sum -c -
+  fi
+}
+
+ensure_trt_extract() {
+  local archive=""
+  archive="$(find "${TRT_VENDOR_ROOT}" -maxdepth 2 -type f -name 'TensorRT-*.tar*' -print -quit 2>/dev/null || true)"
+  if [[ -z "${archive}" ]]; then
+    return 0
+  fi
+  local install_root="${TRT_VENDOR_ROOT}/install"
+  if [[ -d "${install_root}/include" ]]; then
+    return 0
+  fi
+  echo "Extracting TensorRT package from ${archive}..."
+  mkdir -p "${install_root}"
+  tar -xf "${archive}" -C "${install_root}"
+  local extracted
+  extracted="$(find "${install_root}" -maxdepth 1 -type d -name 'TensorRT*' -print -quit 2>/dev/null || true)"
+  if [[ -n "${extracted}" && -d "${extracted}/include" ]]; then
+    rsync -a "${extracted}/" "${install_root}/"
+  fi
+}
+
+ensure_trt_tarball
 if ! command -v apt-get >/dev/null 2>&1; then
   echo "apt-get not found. This script is for Debian/Ubuntu."
   exit 1
@@ -118,6 +140,8 @@ apt-get install -y \
   libnccl-dev=2.27.7-1+cuda12.9
 
 pkgs=(
+  ca-certificates
+  curl
   libnvinfer10
   libnvinfer-dev
   libnvonnxparsers10
@@ -155,6 +179,180 @@ if [[ ${WITH_LFS} -eq 1 ]]; then
 fi
 
 apt-get install -y "${pkgs[@]}"
+
+ensure_trt_tarball
+ensure_trt_extract
+
+has_trt_libs() {
+  if find "${TRT_VENDOR_ROOT}" -type f -name 'libnvinfer.so*' -print -quit 2>/dev/null | grep -q .; then
+    return 0
+  fi
+  if ldconfig -p 2>/dev/null | awk '{print $1}' | grep -q '^libnvinfer\.so'; then
+    return 0
+  fi
+  if find /usr/lib /usr/lib/x86_64-linux-gnu /lib/x86_64-linux-gnu -type f -name 'libnvinfer.so*' -print -quit 2>/dev/null | grep -q .; then
+    return 0
+  fi
+  return 1
+}
+
+ensure_trt_debs() {
+  if [[ "${TENSORRT_INSTALL_DEBS}" != "1" ]]; then
+    return 0
+  fi
+  local py_trt_installed=0
+  if dpkg -s python3-libnvinfer >/dev/null 2>&1; then
+    py_trt_installed=1
+  fi
+  if [[ -z "${TENSORRT_DEB_VERSION}" ]]; then
+    cuda_ver=""
+    if [[ -f "/usr/local/cuda/version.json" ]]; then
+      cuda_ver="$(python - <<'PY'
+import json
+try:
+    with open("/usr/local/cuda/version.json", "r", encoding="utf-8") as f:
+        print(json.load(f).get("cuda", {}).get("version", ""))
+except Exception:
+    pass
+PY
+)"
+    elif command -v nvcc >/dev/null 2>&1; then
+      cuda_ver="$(nvcc --version | awk -F'release ' '/release/ {print $2}' | awk '{print $1}')"
+    fi
+    if [[ "${cuda_ver}" == 12.8* ]]; then
+      TENSORRT_DEB_VERSION="10.9.0.34-1+cuda12.8"
+    fi
+  fi
+  if [[ -z "${TENSORRT_DEB_VERSION}" && ${py_trt_installed} -eq 1 && has_trt_libs ]]; then
+    return 0
+  fi
+  local candidate=""
+  candidate="$(apt-cache policy libnvinfer10 2>/dev/null | awk '/Candidate:/ {print $2}')"
+  if [[ -z "${candidate}" || "${candidate}" == "(none)" ]]; then
+    echo "Installing NVIDIA CUDA keyring for TensorRT debs..."
+    curl -L --fail --retry 3 --retry-delay 2 -o /tmp/cuda-keyring.deb \
+      https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
+    dpkg -i /tmp/cuda-keyring.deb
+    apt-get update
+  fi
+  if [[ -n "${TENSORRT_DEB_VERSION}" ]]; then
+    echo "Installing TensorRT debs pinned to ${TENSORRT_DEB_VERSION}..."
+    apt-mark unhold \
+      libnvinfer10 libnvinfer-dev libnvinfer-headers-dev \
+      libnvinfer-plugin10 libnvinfer-plugin-dev libnvinfer-headers-plugin-dev \
+      libnvinfer-lean10 libnvinfer-lean-dev \
+      libnvinfer-dispatch10 libnvinfer-dispatch-dev \
+      libnvinfer-vc-plugin10 libnvinfer-vc-plugin-dev \
+      libnvonnxparsers10 libnvonnxparsers-dev \
+      python3-libnvinfer python3-libnvinfer-dev \
+      python3-libnvinfer-lean python3-libnvinfer-dispatch || true
+    apt-get install -y --allow-downgrades --allow-change-held-packages \
+      "libnvinfer10=${TENSORRT_DEB_VERSION}" \
+      "libnvinfer-dev=${TENSORRT_DEB_VERSION}" \
+      "libnvinfer-headers-dev=${TENSORRT_DEB_VERSION}" \
+      "libnvinfer-plugin10=${TENSORRT_DEB_VERSION}" \
+      "libnvinfer-plugin-dev=${TENSORRT_DEB_VERSION}" \
+      "libnvinfer-headers-plugin-dev=${TENSORRT_DEB_VERSION}" \
+      "libnvinfer-lean10=${TENSORRT_DEB_VERSION}" \
+      "libnvinfer-lean-dev=${TENSORRT_DEB_VERSION}" \
+      "libnvinfer-dispatch10=${TENSORRT_DEB_VERSION}" \
+      "libnvinfer-dispatch-dev=${TENSORRT_DEB_VERSION}" \
+      "libnvinfer-vc-plugin10=${TENSORRT_DEB_VERSION}" \
+      "libnvinfer-vc-plugin-dev=${TENSORRT_DEB_VERSION}" \
+      "libnvonnxparsers10=${TENSORRT_DEB_VERSION}" \
+      "libnvonnxparsers-dev=${TENSORRT_DEB_VERSION}" \
+      "python3-libnvinfer=${TENSORRT_DEB_VERSION}" \
+      "python3-libnvinfer-lean=${TENSORRT_DEB_VERSION}" \
+      "python3-libnvinfer-dispatch=${TENSORRT_DEB_VERSION}" \
+      "python3-libnvinfer-dev=${TENSORRT_DEB_VERSION}"
+  else
+    apt-get install -y \
+      libnvinfer10 \
+      libnvinfer-dev \
+      libnvinfer-plugin10 \
+      libnvinfer-headers-plugin-dev \
+      libnvonnxparsers10 \
+      libnvonnxparsers-dev \
+      python3-libnvinfer \
+      python3-libnvinfer-dev
+  fi
+}
+
+ensure_trt_debs
+
+TRT_ROOT_CANDIDATE=""
+if [[ -d "${TRT_VENDOR_ROOT}/install/include" ]]; then
+  TRT_ROOT_CANDIDATE="${TRT_VENDOR_ROOT}/install"
+elif [[ -d "${TRT_VENDOR_ROOT}/include" ]]; then
+  TRT_ROOT_CANDIDATE="${TRT_VENDOR_ROOT}"
+elif [[ -f "/usr/include/x86_64-linux-gnu/NvInfer.h" ]] || [[ -f "/usr/include/NvInfer.h" ]]; then
+  TRT_ROOT_CANDIDATE="/usr"
+fi
+if ! has_trt_libs; then
+  echo "Error: TensorRT libraries (libnvinfer.so*) not found after install."
+  echo "Provide a TensorRT tarball in ${TRT_VENDOR_ROOT} or set TENSORRT_TARBALL_URL,"
+  echo "or ensure NVIDIA TensorRT debs are available in your apt repos."
+  exit 1
+fi
+if [[ -n "${TRT_ROOT_CANDIDATE}" ]]; then
+  export VLLM_TENSORRT_ROOT="${VLLM_TENSORRT_ROOT:-${TRT_ROOT_CANDIDATE}}"
+  export TENSORRT_ROOT="${TENSORRT_ROOT:-${VLLM_TENSORRT_ROOT}}"
+  export TensorRT_ROOT="${TensorRT_ROOT:-${VLLM_TENSORRT_ROOT}}"
+  export TRT_ROOT="${TRT_ROOT:-${VLLM_TENSORRT_ROOT}}"
+  if [[ -n "${CMAKE_PREFIX_PATH:-}" ]]; then
+    if [[ ":${CMAKE_PREFIX_PATH}:" != *":${VLLM_TENSORRT_ROOT}:"* ]]; then
+      export CMAKE_PREFIX_PATH="${VLLM_TENSORRT_ROOT}:${CMAKE_PREFIX_PATH}"
+    fi
+  else
+    export CMAKE_PREFIX_PATH="${VLLM_TENSORRT_ROOT}"
+  fi
+  for libdir in "${VLLM_TENSORRT_ROOT}/lib" "${VLLM_TENSORRT_ROOT}/lib64" \
+                "${VLLM_TENSORRT_ROOT}/lib/x86_64-linux-gnu" \
+                "${VLLM_TENSORRT_ROOT}/targets/x86_64-linux/lib"; do
+    if [[ -d "${libdir}" ]]; then
+      export LD_LIBRARY_PATH="${libdir}:${LD_LIBRARY_PATH:-}"
+      export LIBRARY_PATH="${libdir}:${LIBRARY_PATH:-}"
+    fi
+  done
+  echo "Using TensorRT root: ${VLLM_TENSORRT_ROOT}"
+fi
+
+ensure_trt_pythonpath() {
+  if [[ ! -d "/usr/lib/python3/dist-packages" && ! -d "/usr/lib/python3.10/dist-packages" ]]; then
+    return 0
+  fi
+  python - <<'PY'
+import os
+import site
+
+dist_paths = ["/usr/lib/python3/dist-packages", "/usr/lib/python3.10/dist-packages"]
+dist_paths = [p for p in dist_paths if os.path.isdir(p)]
+if not dist_paths:
+    raise SystemExit(0)
+
+targets = []
+for base in site.getsitepackages():
+    targets.append(base)
+user_site = site.getusersitepackages()
+if user_site:
+    targets.append(user_site)
+
+for base in targets:
+    os.makedirs(base, exist_ok=True)
+    pth = os.path.join(base, "tensorrt_system.pth")
+    existing = set()
+    if os.path.exists(pth):
+        with open(pth, "r", encoding="utf-8") as f:
+            existing = {line.strip() for line in f if line.strip()}
+    with open(pth, "w", encoding="utf-8") as f:
+        for p in dist_paths:
+            existing.add(p)
+        for p in sorted(existing):
+            f.write(p + "\n")
+PY
+}
+
+ensure_trt_pythonpath
 
 ensure_nvtx_headers() {
   if [[ -f "/usr/local/cuda/include/nvtx3/nvtx3.hpp" ]] \
@@ -308,13 +506,124 @@ if [[ ${WITH_UCX} -eq 1 ]]; then
     done
   fi
 fi
-pip install torch==2.9.1 torchvision==0.24.1 torchaudio==2.9.1 --index-url https://download.pytorch.org/whl/cu128 --no-input --exists-action i
+python -m pip install torch==2.9.1 torchvision==0.24.1 torchaudio==2.9.1 --index-url https://download.pytorch.org/whl/cu128 --no-input --exists-action i
 python -m pip install -U pip packaging setuptools wheel setuptools-scm --no-input --exists-action i
 if [[ ${WITH_MPI} -eq 1 ]]; then
   python -m pip install -U mpi4py --no-input --exists-action i
 fi
-python -m pip install --extra-index-url https://pypi.nvidia.com tensorrt --no-input --exists-action i \
-  || python -m pip install --extra-index-url https://pypi.nvidia.com nvidia-tensorrt --no-input --exists-action i
+
+TRT_PYTHON_DIR="${TRT_VENDOR_ROOT}/python"
+TRT_LOCAL_ROOT="${VLLM_TENSORRT_ROOT:-}"
+if [[ -n "${TRT_LOCAL_ROOT}" && -d "${TRT_LOCAL_ROOT}/python" ]]; then
+  TRT_PYTHON_DIR="${TRT_LOCAL_ROOT}/python"
+fi
+TRT_WHEEL_GLOB="${TRT_PYTHON_DIR}/build/bindings_wheel/dist/tensorrt-*.whl"
+
+python -m pip uninstall -y tensorrt tensorrt_bindings tensorrt_libs tensorrt_dispatch_libs tensorrt_lean_libs nvidia-tensorrt \
+  tensorrt_cu12 tensorrt_cu12_bindings tensorrt_cu12_libs \
+  tensorrt_cu13 tensorrt_cu13_bindings tensorrt_cu13_libs \
+  || true
+python - <<'PY'
+import site
+import shutil
+import os
+
+paths = []
+for base in site.getsitepackages():
+    paths.append(base)
+user_site = site.getusersitepackages()
+if user_site:
+    paths.append(user_site)
+
+for base in paths:
+    for name in (
+        "tensorrt",
+        "tensorrt_bindings",
+        "tensorrt_libs",
+        "tensorrt_dispatch_libs",
+        "tensorrt_lean_libs",
+        "tensorrt_cu12",
+        "tensorrt_cu12_bindings",
+        "tensorrt_cu12_libs",
+        "tensorrt_cu13",
+        "tensorrt_cu13_bindings",
+        "tensorrt_cu13_libs",
+    ):
+        path = os.path.join(base, name)
+        if os.path.isdir(path):
+            shutil.rmtree(path, ignore_errors=True)
+PY
+
+if [[ ${USE_LOCAL_TENSORRT} -eq 1 && -n "${TRT_LOCAL_ROOT}" && -d "${TRT_PYTHON_DIR}" && -f "${TRT_LOCAL_ROOT}/include/NvInfer.h" ]]; then
+  if ! ls ${TRT_WHEEL_GLOB} >/dev/null 2>&1; then
+    PYVER=$(python - <<'PY'
+import sys
+print(f"{sys.version_info.major}.{sys.version_info.minor}")
+PY
+)
+    PYTHON_MAJOR_VERSION="${PYVER%%.*}"
+    PYTHON_MINOR_VERSION="${PYVER##*.}"
+    TRT_LIBPATH=""
+    for libdir in "${TRT_LOCAL_ROOT}/lib" "${TRT_LOCAL_ROOT}/lib64" "${TRT_LOCAL_ROOT}/targets/x86_64-linux/lib"; do
+      if [[ -d "${libdir}" ]]; then
+        TRT_LIBPATH="${libdir}"
+        break
+      fi
+    done
+    if [[ -z "${TRT_LIBPATH}" ]]; then
+      libnvinfer_path="$(find "${TRT_LOCAL_ROOT}" -type f -name 'libnvinfer.so*' -print -quit 2>/dev/null || true)"
+      if [[ -n "${libnvinfer_path}" ]]; then
+        TRT_LIBPATH="$(dirname "${libnvinfer_path}")"
+      fi
+    fi
+    if [[ -z "${TRT_LIBPATH}" ]]; then
+      sys_libnvinfer="$(ldconfig -p 2>/dev/null | awk '/libnvinfer\.so/ {print $NF; exit}')"
+      if [[ -z "${sys_libnvinfer}" ]]; then
+        sys_libnvinfer="$(find /usr/lib /usr/lib/x86_64-linux-gnu /lib/x86_64-linux-gnu -type f -name 'libnvinfer.so*' -print -quit 2>/dev/null || true)"
+      fi
+      if [[ -n "${sys_libnvinfer}" ]]; then
+        TRT_LIBPATH="$(dirname "${sys_libnvinfer}")"
+        echo "Using system TensorRT libraries from ${TRT_LIBPATH}"
+      fi
+    fi
+    if [[ -z "${TRT_LIBPATH}" ]]; then
+      echo "Error: TensorRT libraries not found."
+      echo "Expected libnvinfer.so* under ${TRT_LOCAL_ROOT} or system paths."
+      echo "Place an NVIDIA TensorRT tarball (TensorRT-*.tar.gz) under ${TRT_VENDOR_ROOT} or install TensorRT dev packages."
+      exit 1
+    fi
+    echo "Building TensorRT Python wheel from ${TRT_LOCAL_ROOT}..."
+    (cd "${TRT_PYTHON_DIR}" && \
+      TRT_OSSPATH="${TRT_LOCAL_ROOT}" \
+      TRT_LIBPATH="${TRT_LIBPATH}" \
+      PYTHON_MAJOR_VERSION="${PYTHON_MAJOR_VERSION}" \
+      PYTHON_MINOR_VERSION="${PYTHON_MINOR_VERSION}" \
+      bash build.sh)
+  fi
+
+  if ls ${TRT_WHEEL_GLOB} >/dev/null 2>&1; then
+    python -m pip install -U ${TRT_WHEEL_GLOB} --no-input --exists-action i
+  else
+    echo "Error: TensorRT wheel not found at ${TRT_WHEEL_GLOB}."
+    exit 1
+  fi
+fi
+
+if ! python - <<'PY' >/dev/null 2>&1
+import tensorrt  # noqa: F401
+PY
+then
+  if [[ ${ALLOW_PIP_TENSORRT} -eq 1 ]]; then
+    echo "Installing TensorRT from NVIDIA PyPI (${TENSORRT_PIP_SPEC})..."
+    python -m pip install --extra-index-url https://pypi.nvidia.com "tensorrt==${TENSORRT_PIP_SPEC}" \
+      --no-input --exists-action i \
+      || python -m pip install --extra-index-url https://pypi.nvidia.com "nvidia-tensorrt==${TENSORRT_PIP_SPEC}" \
+        --no-input --exists-action i
+  else
+    echo "Error: TensorRT import failed and pip fallback is disabled (ALLOW_PIP_TENSORRT=0)."
+    exit 1
+  fi
+fi
 
 if [[ ${WITH_LFS} -eq 1 ]]; then
   if command -v git >/dev/null 2>&1; then

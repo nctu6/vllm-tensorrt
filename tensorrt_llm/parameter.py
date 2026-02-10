@@ -248,9 +248,15 @@ class Parameter:
         if self.is_managed(network):
             self._get_weights(network).name = name
             return True
-        else:
-            return network.trt_network.set_weights_name(
-                self._get_weights(network), name)
+        weights = self._get_weights(network)
+        if weights is None:
+            return False
+        if isinstance(weights, np.ndarray):
+            try:
+                weights = trt.Weights(weights)
+            except Exception:
+                return False
+        return network.trt_network.set_weights_name(weights, name)
 
     def _get_weights(self, network) -> trt.Weights | Tensor | None:
         tensor = network.get_parameter_tensor(self)
